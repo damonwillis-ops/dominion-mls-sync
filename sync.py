@@ -2,19 +2,21 @@
 """
 Dominion MLS Sync — automated daily export from Paragon MLS.
 
-Logs into CARMLS Paragon, searches for expired/withdrawn listings,
-exports CSV, and uploads rows to Dominion's Supabase staging table.
+Logs into CARMLS Paragon, loads the saved search "DOMINION - DAILY EXPIREDS",
+sets the date to yesterday, exports CSV, and uploads to Dominion's Supabase
+staging table.
 
 Usage:
   python sync.py --setup     # first-time setup (credentials, Chromium, cron)
   python sync.py             # run sync now
   python sync.py --visible   # run with visible browser (for debugging)
 
-Selectors are based on Paragon's current DOM. If Paragon redesigns their UI,
-re-record selectors with: playwright codegen https://ims.paragonrels.com
+Selectors based on Paragon current DOM (recorded 2026-07-15).
+Re-record if Paragon updates UI: playwright codegen https://carmls.paragonrels.com
 """
 
 import asyncio
+import calendar
 import csv
 import getpass
 import logging
@@ -35,10 +37,12 @@ from supabase import create_client
 ROOT = Path(__file__).parent
 load_dotenv(ROOT / ".env")
 
-PARAGON_LOGIN_URL = "https://ims.paragonrels.com/ParagonLS/default.mvc/Login"
+PARAGON_LOGIN_URL = "https://carmls.paragonrels.com/ParagonLS/Default.mvc/Login"
+PARAGON_HOME_URL  = "https://carmls.paragonrels.com/ParagonLS/Default.mvc"
+SAVED_SEARCH_NAME = "DOMINION - DAILY EXPIREDS"
 DOWNLOAD_DIR = ROOT / "data" / "downloads"
 LOG_DIR = ROOT / "data" / "logs"
-NAV_TIMEOUT = 30_000   # 30s
+NAV_TIMEOUT = 30_000    # 30s
 DOWNLOAD_TIMEOUT = 60_000  # 60s
 
 logger = logging.getLogger("mls_sync")
@@ -49,7 +53,7 @@ logger = logging.getLogger("mls_sync")
 # ---------------------------------------------------------------------------
 
 class SyncError(Exception):
-    """Sync failure with diagnostic context for Claude to parse."""
+    """Sync failure with diagnostic context."""
 
     def __init__(self, message: str, step: str, suggestion: str, screenshot_path: str | None = None):
         super().__init__(message)
@@ -117,9 +121,9 @@ def _get_supabase():
 async def _screenshot_on_error(page: Page, step: str) -> str:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    path = DOWNLOAD_DIR / f"error_{ts}.png"
+    path = DOWNLOAD_DIR / f"error_{step}_{ts}.png"
     try:
-        await page.screenshot(path=str(path))
+        await page.screenshot(path=str(path), full_page=True)
     except Exception:
         return "screenshot_failed"
     return str(path)
@@ -130,141 +134,192 @@ async def _screenshot_on_error(page: Page, step: str) -> str:
 # ---------------------------------------------------------------------------
 
 async def _login(page: Page, username: str, password: str):
-    """Log into Paragon MLS."""
+    """Log into Paragon MLS. Handles concurrent session override automatically."""
     logger.info("Logging into Paragon...")
     await page.goto(PARAGON_LOGIN_URL, timeout=NAV_TIMEOUT)
 
     try:
-        await page.fill("#UserName", username, timeout=NAV_TIMEOUT)
-        await page.fill("#Password", password, timeout=NAV_TIMEOUT)
+        await page.get_by_role("textbox", name="Username").fill(username, timeout=NAV_TIMEOUT)
+        await page.get_by_role("textbox", name="Password").fill(password, timeout=NAV_TIMEOUT)
     except PWTimeout:
         ss = await _screenshot_on_error(page, "login")
         raise SyncError(
-            "Login form selectors not found — Paragon may have changed their login page.",
+            "Login form not found.",
             step="login",
-            suggestion="Run `playwright codegen https://ims.paragonrels.com` to inspect current selectors.",
+            suggestion="Run: playwright codegen https://carmls.paragonrels.com",
             screenshot_path=ss,
         )
 
-    await page.click("input[type='submit'], button[type='submit']", timeout=NAV_TIMEOUT)
+    # Click Login — may need second click to override concurrent session
+    await page.get_by_role("button", name="Login").click()
+    await page.wait_for_timeout(2000)
+
+    # If still on login page (concurrent session prompt), click again
+    if "Login" in page.url:
+        logger.info("Concurrent session detected — overriding...")
+        await page.get_by_role("button", name="Login").click()
 
     try:
         await page.wait_for_url(lambda url: "Login" not in url, timeout=NAV_TIMEOUT)
     except PWTimeout:
         ss = await _screenshot_on_error(page, "login")
-        error_text = await page.text_content(".validation-summary-errors, .error-message") or ""
         raise SyncError(
-            f"Login failed — credentials rejected. {error_text.strip()}",
+            "Login failed — credentials rejected or session override failed.",
             step="login",
             suggestion="Check PARAGON_USERNAME and PARAGON_PASSWORD in .env.",
             screenshot_path=ss,
         )
 
+    # Navigate to home to trigger any post-login popups
+    await page.goto(PARAGON_HOME_URL, timeout=NAV_TIMEOUT)
+    await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
+
+    # Dismiss Board Messages or any modal popup
+    try:
+        close_btn = page.get_by_role("button", name="Close")
+        if await close_btn.count() > 0:
+            await close_btn.first.click(timeout=5000)
+            logger.info("Closed Board Messages popup.")
+    except Exception:
+        pass  # No popup — fine
+
     logger.info("Login successful.")
 
 
-async def _run_search(page: Page):
-    """Navigate to search, set expired/withdrawn criteria, execute."""
-    logger.info("Setting search criteria...")
-
-    await page.click("text=Search", timeout=NAV_TIMEOUT)
-    await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
-
-    # Status = Expired + Withdrawn
-    try:
-        status_selector = "[data-field='Status'], #Status, select[name*='Status']"
-        await page.click(status_selector, timeout=NAV_TIMEOUT)
-
-        for status_val in ["Expired", "Withdrawn", "EXP", "WITH"]:
-            option = page.locator(f"text='{status_val}'")
-            if await option.count() > 0:
-                await option.first.click()
-    except PWTimeout:
-        ss = await _screenshot_on_error(page, "search")
-        raise SyncError(
-            "Could not find Status field in search form.",
-            step="search",
-            suggestion="Paragon updated search UI. Run `playwright codegen https://ims.paragonrels.com` to re-record selectors.",
-            screenshot_path=ss,
-        )
-
-    # Date range — yesterday to today (daily delta)
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%m/%d/%Y")
-    today = datetime.now().strftime("%m/%d/%Y")
-
-    date_fields = page.locator("input[data-field*='Date'], input[name*='Date'], input[placeholder*='date']")
-    if await date_fields.count() >= 2:
-        await date_fields.nth(0).fill(yesterday)
-        await date_fields.nth(1).fill(today)
-    else:
-        logger.warning("Could not find date range fields — searching without date filter.")
-
-    # Property Type = Residential
-    res_option = page.locator("text='Residential'")
-    if await res_option.count() > 0:
-        await res_option.first.click()
-
-    # Execute search
-    search_btn = page.locator("button:has-text('Search'), input[value='Search'], a:has-text('Search')")
-    await search_btn.first.click(timeout=NAV_TIMEOUT)
+async def _load_saved_search(page: Page):
+    """Navigate to Saved Property Searches and open DOMINION - DAILY EXPIREDS."""
+    logger.info("Opening saved search...")
 
     try:
+        await page.locator("#search-nav").click(timeout=NAV_TIMEOUT)
+        await page.get_by_text("Saved Property Searches").click(timeout=NAV_TIMEOUT)
         await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
     except PWTimeout:
-        ss = await _screenshot_on_error(page, "search")
+        ss = await _screenshot_on_error(page, "nav")
         raise SyncError(
-            "Search results did not load.",
-            step="search",
-            suggestion="MLS may be slow. Try again: python sync.py",
+            "Could not find Search navigation menu.",
+            step="nav",
+            suggestion="Paragon may have updated nav. Re-record: playwright codegen https://carmls.paragonrels.com",
             screenshot_path=ss,
         )
 
-    logger.info("Search complete, results loaded.")
+    # Saved searches list is inside tab1 iframe
+    tab1 = page.locator('iframe[name="tab1"]').content_frame
+
+    try:
+        search_link = tab1.get_by_role("link", name=SAVED_SEARCH_NAME)
+        await search_link.wait_for(timeout=NAV_TIMEOUT)
+        await search_link.click()
+        await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
+    except PWTimeout:
+        ss = await _screenshot_on_error(page, "saved_search")
+        raise SyncError(
+            f'Saved search "{SAVED_SEARCH_NAME}" not found.',
+            step="saved_search",
+            suggestion=f'Create a saved search named "{SAVED_SEARCH_NAME}" in Paragon for Expired/Withdrawn listings.',
+            screenshot_path=ss,
+        )
+
+    logger.info(f'Loaded saved search: {SAVED_SEARCH_NAME}')
+
+
+async def _set_yesterday_date(page: Page):
+    """Set the search date to yesterday using Paragon's calendar picker."""
+    yesterday = datetime.now() - timedelta(days=1)
+    day_str = str(yesterday.day)  # "14", "1", etc — no leading zero (calendar link text)
+
+    logger.info(f"Setting date to yesterday: {yesterday.strftime('%Y-%m-%d')}")
+
+    # Search form is in tab2_1_1 iframe
+    form = page.locator('iframe[name="tab2_1_1"]').content_frame
+
+    try:
+        # Click "Select Date" (first one — the from-date field)
+        await form.get_by_role("link", name="Select Date").first.click(timeout=NAV_TIMEOUT)
+        await page.wait_for_timeout(1000)
+
+        # If yesterday is in a different month than today (1st of month edge case),
+        # click the back arrow on the calendar to go to previous month
+        today = datetime.now()
+        if yesterday.month != today.month:
+            prev_arrow = form.locator("a.ui-datepicker-prev, .ui-datepicker-prev")
+            if await prev_arrow.count() > 0:
+                await prev_arrow.click()
+                await page.wait_for_timeout(500)
+
+        # Click yesterday's day number
+        await form.get_by_role("link", name=day_str, exact=True).click(timeout=NAV_TIMEOUT)
+        logger.info(f"Date set to {yesterday.strftime('%Y-%m-%d')}.")
+
+    except PWTimeout:
+        ss = await _screenshot_on_error(page, "date")
+        raise SyncError(
+            "Could not set date in search form.",
+            step="date",
+            suggestion="Calendar picker may have changed. Run sync.py --visible to inspect.",
+            screenshot_path=ss,
+        )
+
+
+async def _run_search(page: Page):
+    """Click Search button in the form frame."""
+    form = page.locator('iframe[name="tab2_1_1"]').content_frame
+
+    try:
+        await form.get_by_role("button", name="Search").click(timeout=NAV_TIMEOUT)
+        await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
+        logger.info("Search executed.")
+    except PWTimeout:
+        ss = await _screenshot_on_error(page, "search")
+        raise SyncError(
+            "Search button not found or results did not load.",
+            step="search",
+            suggestion="Run sync.py --visible to inspect the form frame.",
+            screenshot_path=ss,
+        )
 
 
 async def _export_csv(page: Page) -> Path:
-    """Select all results and export as CSV."""
+    """Select all results and export as CSV. Results live in nested iframes."""
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     logger.info("Exporting CSV...")
 
-    # Select all
-    select_all = page.locator("input[type='checkbox'][id*='SelectAll'], text='Select All', input[title*='Select All']")
-    if await select_all.count() > 0:
-        await select_all.first.click()
-
-    # Export — trigger click inside expect_download
-    export_btn = page.locator("text='Export', text='Download', button:has-text('Export'), a:has-text('Export')")
+    results_frame = page.locator('iframe[name="tab2_1_2"]').content_frame
+    grid_frame = results_frame.locator('iframe[name="ifSpreadsheet"]').content_frame
 
     try:
+        # Select all rows
+        await grid_frame.locator("#cb_grid").check(timeout=NAV_TIMEOUT)
+        logger.info("Selected all rows.")
+    except PWTimeout:
+        ss = await _screenshot_on_error(page, "select_all")
+        raise SyncError(
+            "Could not find results grid (#cb_grid). Search may have returned 0 results.",
+            step="select_all",
+            suggestion="Check if yesterday had any expired/withdrawn listings in CARMLS.",
+            screenshot_path=ss,
+        )
+
+    try:
+        # Export menu
+        await results_frame.get_by_role("link", name="Export »").click(timeout=NAV_TIMEOUT)
+        await results_frame.get_by_role("link", name="Export to CSV").click(timeout=NAV_TIMEOUT)
+
+        # Export confirmation popup + download
         async with page.expect_download(timeout=DOWNLOAD_TIMEOUT) as download_info:
-            try:
-                await export_btn.first.click(timeout=NAV_TIMEOUT)
-            except PWTimeout:
-                ss = await _screenshot_on_error(page, "export")
-                raise SyncError(
-                    "Export button not found.",
-                    step="export",
-                    suggestion="Paragon changed export flow. Run `playwright codegen` to re-record.",
-                    screenshot_path=ss,
-                )
-
-            # Format selection dialog — pick CSV
-            csv_option = page.locator("text='CSV', input[value='CSV'], option[value='CSV']")
-            if await csv_option.count() > 0:
-                await csv_option.first.click()
-
-            # Confirm button
-            confirm = page.locator("button:has-text('Download'), button:has-text('OK'), button:has-text('Export')")
-            if await confirm.count() > 0:
-                await confirm.first.click()
+            async with page.expect_popup() as popup_info:
+                await page.get_by_role("button", name="Export").click(timeout=NAV_TIMEOUT)
+            popup = await popup_info.value
+            await popup.close()
 
         download = await download_info.value
+
     except PWTimeout:
         ss = await _screenshot_on_error(page, "export")
         raise SyncError(
-            "CSV download timed out (60s).",
+            "CSV export timed out or export controls not found.",
             step="export",
-            suggestion="MLS may be slow. Try again: python sync.py",
+            suggestion="Run sync.py --visible to inspect the export flow.",
             screenshot_path=ss,
         )
 
@@ -290,7 +345,6 @@ def _upload_to_staging(csv_path: Path) -> dict:
         logger.info("CSV is empty — nothing to upload.")
         return {"uploaded": 0, "csv_rows": 0}
 
-    # Normalize headers (lowercase, strip)
     header_map = {h.strip().lower(): h for h in rows[0].keys()}
 
     def get(row, *candidates):
@@ -332,7 +386,6 @@ def _upload_to_staging(csv_path: Path) -> dict:
         logger.info("No valid rows found in CSV.")
         return {"uploaded": 0, "csv_rows": len(rows)}
 
-    # Upsert to staging table (mls_number is the dedup key)
     db.table("paragon_staging").upsert(
         staged,
         on_conflict="mls_number",
@@ -366,7 +419,7 @@ def _cleanup_old(directory: Path, keep_days: int = 7):
 # ---------------------------------------------------------------------------
 
 async def sync(headless: bool = True) -> dict:
-    """Full sync: login → search → export CSV → upload to Supabase."""
+    """Full sync: login → saved search → set date → export CSV → upload to Supabase."""
     _setup_logging()
 
     try:
@@ -381,12 +434,13 @@ async def sync(headless: bool = True) -> dict:
             page.set_default_timeout(NAV_TIMEOUT)
 
             await _login(page, username, password)
+            await _load_saved_search(page)
+            await _set_yesterday_date(page)
             await _run_search(page)
             csv_path = await _export_csv(page)
 
             await browser.close()
 
-        # Upload to Supabase staging
         upload_result = _upload_to_staging(csv_path)
         logger.info(f"Done! {upload_result['uploaded']} leads staged for Dominion.")
 
@@ -478,9 +532,8 @@ async def setup():
     print("=" * 45)
     print()
 
-    # 1. Paragon credentials
     print("Step 1: Paragon MLS credentials")
-    print("  (Your CARMLS login for ims.paragonrels.com)")
+    print("  (Your CARMLS login for carmls.paragonrels.com)")
     print()
     username = input("  Paragon username: ").strip()
     password = getpass.getpass("  Paragon password: ").strip()
@@ -489,7 +542,6 @@ async def setup():
         print("\n  ERROR: Username and password are required.")
         return
 
-    # 2. Supabase credentials
     print()
     print("Step 2: Dominion Supabase connection")
     print("  (Get these from Damon)")
@@ -501,26 +553,21 @@ async def setup():
         print("\n  ERROR: Supabase credentials are required.")
         return
 
-    # 3. Write .env
     _write_env(username, password, supabase_url, supabase_key)
     print("\n  Credentials saved to .env")
 
-    # Set for current session
     os.environ["PARAGON_USERNAME"] = username
     os.environ["PARAGON_PASSWORD"] = password
     os.environ["SUPABASE_URL"] = supabase_url
     os.environ["SUPABASE_SERVICE_ROLE_KEY"] = supabase_key
 
-    # 4. Install Chromium
     print("\nStep 3: Installing browser...")
     subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
     print("  Chromium installed.")
 
-    # 5. Create directories
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 6. Test login
     print("\nStep 4: Testing Paragon login...")
     if await _test_login(username, password):
         print("  Login successful!")
@@ -529,7 +576,6 @@ async def setup():
         print("  Re-run: python sync.py --setup")
         return
 
-    # 7. Cron
     print()
     install = input("Step 5: Install daily cron job (6 AM)? [y/N]: ").strip().lower()
     if install == "y":

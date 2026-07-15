@@ -192,7 +192,7 @@ async def _load_saved_search(page: Page):
 
     try:
         await page.locator("#search-nav").click(timeout=NAV_TIMEOUT)
-        await page.get_by_text("Saved Property Searches").click(timeout=NAV_TIMEOUT)
+        await page.locator("#app_banner_menu").get_by_text("Saved Property Searches").click(timeout=NAV_TIMEOUT)
         await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
     except PWTimeout:
         ss = await _screenshot_on_error(page, "nav")

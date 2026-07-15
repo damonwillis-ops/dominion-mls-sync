@@ -170,15 +170,17 @@ async def _login(page: Page, username: str, password: str):
             screenshot_path=ss,
         )
 
-    # Navigate to home to trigger any post-login popups
+    # Navigate to home and wait for DOM (not networkidle — Paragon keeps polling)
     await page.goto(PARAGON_HOME_URL, timeout=NAV_TIMEOUT)
-    await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
+    await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
+    await page.wait_for_timeout(2000)  # let nav bar render
 
     # Dismiss Board Messages or any modal popup
     try:
         close_btn = page.get_by_role("button", name="Close")
         if await close_btn.count() > 0:
             await close_btn.first.click(timeout=5000)
+            await page.wait_for_timeout(1000)
             logger.info("Closed Board Messages popup.")
     except Exception:
         pass  # No popup — fine
@@ -187,12 +189,32 @@ async def _login(page: Page, username: str, password: str):
 
 
 async def _load_saved_search(page: Page):
-    """Click DOMINION - DAILY EXPIREDS from the Saved Property Searches list (tab1 iframe)."""
+    """Navigate to Saved Property Searches and click DOMINION - DAILY EXPIREDS."""
     logger.info("Opening saved search...")
 
     try:
-        # Page lands on Saved Property Searches after login — no nav needed.
-        # The list is inside iframe[name="tab1"].
+        # Click SEARCH in the top nav bar — try multiple selectors
+        search_nav = page.locator("#search-nav, a[href*='Search'][class*='nav'], img[alt*='Search']").first
+        await search_nav.wait_for(state="visible", timeout=NAV_TIMEOUT)
+        await search_nav.click()
+        await page.wait_for_timeout(500)
+
+        # Click Saved Property Searches in the dropdown
+        await page.locator("#app_banner_menu").get_by_text("Saved Property Searches").click(timeout=NAV_TIMEOUT)
+        await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
+        await page.wait_for_timeout(1500)
+
+    except PWTimeout:
+        ss = await _screenshot_on_error(page, "nav")
+        raise SyncError(
+            "Could not click Search nav or Saved Property Searches menu.",
+            step="nav",
+            suggestion="Re-record selectors: playwright codegen https://carmls.paragonrels.com",
+            screenshot_path=ss,
+        )
+
+    try:
+        # Saved searches list is in tab1 iframe
         tab1 = page.locator('iframe[name="tab1"]')
         await tab1.wait_for(state="attached", timeout=NAV_TIMEOUT)
         tab1_frame = tab1.content_frame
@@ -200,7 +222,7 @@ async def _load_saved_search(page: Page):
         search_link = tab1_frame.get_by_role("link", name=SAVED_SEARCH_NAME)
         await search_link.wait_for(timeout=NAV_TIMEOUT)
         await search_link.click()
-        await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
+        await page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
 
     except PWTimeout:
         ss = await _screenshot_on_error(page, "saved_search")

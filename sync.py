@@ -190,18 +190,25 @@ async def _load_saved_search(page: Page):
     """Navigate to Saved Property Searches and open DOMINION - DAILY EXPIREDS."""
     logger.info("Opening saved search...")
 
-    try:
-        await page.locator("#search-nav").click(timeout=NAV_TIMEOUT)
-        await page.locator("#app_banner_menu").get_by_text("Saved Property Searches").click(timeout=NAV_TIMEOUT)
-        await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
-    except PWTimeout:
-        ss = await _screenshot_on_error(page, "nav")
-        raise SyncError(
-            "Could not find Search navigation menu.",
-            step="nav",
-            suggestion="Paragon may have updated nav. Re-record: playwright codegen https://carmls.paragonrels.com",
-            screenshot_path=ss,
-        )
+    # If already on Saved Property Searches (tab1 iframe present), skip nav
+    already_there = await page.locator('iframe[name="tab1"]').count() > 0
+
+    if not already_there:
+        try:
+            await page.locator("#search-nav").wait_for(state="visible", timeout=NAV_TIMEOUT)
+            await page.locator("#search-nav").click()
+            await page.locator("#app_banner_menu").get_by_text("Saved Property Searches").click(timeout=NAV_TIMEOUT)
+            await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
+        except PWTimeout:
+            ss = await _screenshot_on_error(page, "nav")
+            raise SyncError(
+                "Could not find Search navigation menu.",
+                step="nav",
+                suggestion="Paragon may have updated nav. Re-record: playwright codegen https://carmls.paragonrels.com",
+                screenshot_path=ss,
+            )
+    else:
+        logger.info("Already on Saved Property Searches — skipping nav.")
 
     # Saved searches list is inside tab1 iframe
     tab1 = page.locator('iframe[name="tab1"]').content_frame

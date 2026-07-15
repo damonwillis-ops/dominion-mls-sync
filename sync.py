@@ -187,43 +187,27 @@ async def _login(page: Page, username: str, password: str):
 
 
 async def _load_saved_search(page: Page):
-    """Navigate to Saved Property Searches and open DOMINION - DAILY EXPIREDS."""
+    """Click DOMINION - DAILY EXPIREDS from the Saved Property Searches list (tab1 iframe)."""
     logger.info("Opening saved search...")
 
-    # If already on Saved Property Searches (tab1 iframe present), skip nav
-    already_there = await page.locator('iframe[name="tab1"]').count() > 0
-
-    if not already_there:
-        try:
-            await page.locator("#search-nav").wait_for(state="visible", timeout=NAV_TIMEOUT)
-            await page.locator("#search-nav").click()
-            await page.locator("#app_banner_menu").get_by_text("Saved Property Searches").click(timeout=NAV_TIMEOUT)
-            await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
-        except PWTimeout:
-            ss = await _screenshot_on_error(page, "nav")
-            raise SyncError(
-                "Could not find Search navigation menu.",
-                step="nav",
-                suggestion="Paragon may have updated nav. Re-record: playwright codegen https://carmls.paragonrels.com",
-                screenshot_path=ss,
-            )
-    else:
-        logger.info("Already on Saved Property Searches — skipping nav.")
-
-    # Saved searches list is inside tab1 iframe
-    tab1 = page.locator('iframe[name="tab1"]').content_frame
-
     try:
-        search_link = tab1.get_by_role("link", name=SAVED_SEARCH_NAME)
+        # Page lands on Saved Property Searches after login — no nav needed.
+        # The list is inside iframe[name="tab1"].
+        tab1 = page.locator('iframe[name="tab1"]')
+        await tab1.wait_for(state="attached", timeout=NAV_TIMEOUT)
+        tab1_frame = tab1.content_frame
+
+        search_link = tab1_frame.get_by_role("link", name=SAVED_SEARCH_NAME)
         await search_link.wait_for(timeout=NAV_TIMEOUT)
         await search_link.click()
         await page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT)
+
     except PWTimeout:
         ss = await _screenshot_on_error(page, "saved_search")
         raise SyncError(
-            f'Saved search "{SAVED_SEARCH_NAME}" not found.',
+            f'Could not find saved search "{SAVED_SEARCH_NAME}" in tab1 iframe.',
             step="saved_search",
-            suggestion=f'Create a saved search named "{SAVED_SEARCH_NAME}" in Paragon for Expired/Withdrawn listings.',
+            suggestion=f'Verify search named "{SAVED_SEARCH_NAME}" exists in Paragon. Run --visible to inspect.',
             screenshot_path=ss,
         )
 
